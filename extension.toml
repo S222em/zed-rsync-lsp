@@ -1,0 +1,11 @@
+id = "rsync-language-server"
+name = "Rsync"
+version = "0.0.1"
+schema_version = 1
+authors = ["Sem Roeten <sem.roeten@gmail.com>"]
+description = "Automaticly sync project with remote server"
+repository = "https://github.com/S222em/zed-rsync-lsp"
+
+[language_servers.rsync]
+name = "Rsync"
+languages = ["Rust"]
