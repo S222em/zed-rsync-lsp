@@ -2,7 +2,6 @@ use std::fs;
 
 use zed_extension_api::{
     register_extension,
-    serde_json::Value,
     settings::{CommandSettings, LspSettings},
     Command, Extension, LanguageServerId, Result, Worktree,
 };
@@ -26,7 +25,6 @@ impl RsyncLspExtension {
             }
         }
 
-        // Get binary path from zed settings.
         let binary_path = binary_settings
             .as_ref()
             .and_then(|binary_settings| binary_settings.path.clone());
@@ -92,22 +90,6 @@ impl Extension for RsyncLspExtension {
                 .and_then(|lsp_settings| lsp_settings.initialization_options);
 
         return Ok(initialization_options);
-    }
-
-    fn language_server_workspace_configuration(
-        &mut self,
-        language_server_id: &LanguageServerId,
-        worktree: &Worktree,
-    ) -> Result<Option<Value>> {
-        if language_server_id.as_ref() != RsyncLspExtension::LANGUAGE_SERVER_ID {
-            return Err(format!("Unknown language server '{language_server_id}'"));
-        }
-
-        let settings = LspSettings::for_worktree(RsyncLspExtension::LANGUAGE_SERVER_ID, worktree)
-            .ok()
-            .and_then(|lsp_settings| lsp_settings.settings);
-
-        return Ok(settings);
     }
 }
 
