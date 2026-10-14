@@ -43,27 +43,34 @@ impl Backend {
         }
     }
 
-    async fn handle_file_event(&self, event: FileEvent) {
+    async fn handle_file_events(&self, events: Vec<FileEvent>) {
         let session = self.session.lock().await;
         let Some(session) = session.as_ref() else {
             return;
         };
 
-        let workspace_path_lock = self.workspace_path.read().await;
-        let Some(workspace_path) = workspace_path_lock.as_ref() else {
+        let workspace_path = self.workspace_path.read().await;
+        let Some(workspace_path) = workspace_path.as_ref() else {
             return;
         };
 
-        let initialization_options_lock = self.initializiation_options.read().await;
-        let Some(initialization_options) = initialization_options_lock.as_ref() else {
+        let initialization_options = self.initializiation_options.read().await;
+        let Some(initialization_options) = initialization_options.as_ref() else {
             return;
         };
 
-        let local_file_path = event.uri.path();
+        let relative_file_paths: Vec<String> = events
+            .iter()
+            .map(|event| {
+                let path = event.uri.path();
+
+                return path.replace(workspace_path, "");
+            })
+            .collect();
 
         let cmd = self.prepare_rsync_update_cmd(
             session,
-            local_file_path,
+            &relative_file_paths,
             workspace_path,
             initialization_options,
         );
@@ -74,35 +81,19 @@ impl Backend {
 
         self.progress_sync_end(progress_token).await;
 
+        let remote_file_paths_msg = relative_file_paths.join(", ");
+
         match result {
             Ok(_) => {
-                let action = match event.typ {
-                    FileChangeType::CREATED => "Created",
-                    FileChangeType::CHANGED => "Changed",
-                    FileChangeType::DELETED => "Deleted",
-                    _ => unreachable!(),
-                };
-
-                info!("{} '{}'", action, local_file_path)
+                info!("Synced file(s): {}", remote_file_paths_msg)
             }
             Err(err) => {
-                let action = match event.typ {
-                    FileChangeType::CREATED => "create",
-                    FileChangeType::CHANGED => "change",
-                    FileChangeType::DELETED => "delete",
-                    _ => unreachable!(),
-                };
+                info!("Failed to sync file(s): {}", remote_file_paths_msg);
+                error!("{}", err);
 
-                let msg = format!(
-                    "Failed to {} '{}': {}",
-                    action,
-                    local_file_path,
-                    err.to_string()
-                );
-
-                error!("{}", msg);
-
-                self.client.show_message(MessageType::ERROR, msg).await;
+                self.client
+                    .show_message(MessageType::ERROR, err.to_string())
+                    .await;
             }
         }
     }
@@ -113,13 +104,13 @@ impl Backend {
             return;
         };
 
-        let workspace_path_lock = self.workspace_path.read().await;
-        let Some(workspace_path) = workspace_path_lock.as_ref() else {
+        let workspace_path = self.workspace_path.read().await;
+        let Some(workspace_path) = workspace_path.as_ref() else {
             return;
         };
 
-        let initialization_options_lock = self.initializiation_options.read().await;
-        let Some(initialization_options) = initialization_options_lock.as_ref() else {
+        let initialization_options = self.initializiation_options.read().await;
+        let Some(initialization_options) = initialization_options.as_ref() else {
             return;
         };
 
@@ -148,19 +139,19 @@ impl Backend {
     fn prepare_rsync_update_cmd(
         &self,
         session: &Session,
-        local_file_path: &str,
+        relative_file_paths: &Vec<String>,
         workspace_path: &str,
         initialization_options: &BackendInitializationOptions,
     ) -> ProcessCommand {
-        let relative_file_path = local_file_path.replace(workspace_path, "");
-
         let mut cmd = self.prepare_rsync_cmd(session, &initialization_options.exclude);
 
+        cmd.args(&["-dr", "--delete"]);
+
+        for relative_file_path in relative_file_paths {
+            cmd.args(&["--include", &relative_file_path]);
+        }
+
         cmd.args(&[
-            "-dr",
-            "--delete",
-            "--include",
-            &relative_file_path,
             "--exclude",
             "*",
             &format!("{}{}", workspace_path, MAIN_SEPARATOR),
@@ -368,9 +359,7 @@ impl LanguageServer for Backend {
     }
 
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
-        for event in params.changes {
-            self.handle_file_event(event).await;
-        }
+        self.handle_file_events(params.changes).await;
     }
 
     async fn execute_command(&self, params: ExecuteCommandParams) -> JsonRpcResult<Option<Value>> {
