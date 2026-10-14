@@ -31,9 +31,6 @@ struct Backend {
     initializiation_options: Arc<RwLock<Option<BackendInitializationOptions>>>,
 }
 
-// TODO folders with [] cause error.
-// TODO updating files in ignored folder cause error.
-
 impl Backend {
     const RESYNC_COMMAND: &str = "resync";
 
@@ -77,20 +74,27 @@ impl Backend {
 
         self.progress_sync_end(progress_token).await;
 
-        let action = match event.typ {
-            FileChangeType::CREATED => "created",
-            FileChangeType::CHANGED => "changed",
-            FileChangeType::DELETED => "deleted",
-            _ => unreachable!(),
-        };
-
         match result {
             Ok(_) => {
-                info!("Synced {} '{}'", action, local_file_path)
+                let action = match event.typ {
+                    FileChangeType::CREATED => "Created",
+                    FileChangeType::CHANGED => "Changed",
+                    FileChangeType::DELETED => "Deleted",
+                    _ => unreachable!(),
+                };
+
+                info!("{} '{}'", action, local_file_path)
             }
             Err(err) => {
+                let action = match event.typ {
+                    FileChangeType::CREATED => "create",
+                    FileChangeType::CHANGED => "change",
+                    FileChangeType::DELETED => "delete",
+                    _ => unreachable!(),
+                };
+
                 let msg = format!(
-                    "Failed to sync {} '{}': {}",
+                    "Failed to {} '{}': {}",
                     action,
                     local_file_path,
                     err.to_string()
