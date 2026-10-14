@@ -1,4 +1,4 @@
-use std::path::{Path, MAIN_SEPARATOR};
+use std::path::MAIN_SEPARATOR;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Error};
@@ -6,7 +6,7 @@ use openssh::{KnownHosts, Session};
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::process::Command as ProcessCommand;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tower_lsp::jsonrpc::Result as JsonRpcResult;
 use tower_lsp::lsp_types::notification::Progress;
 use tower_lsp::lsp_types::request::WorkDoneProgressCreate;
@@ -27,9 +27,12 @@ pub struct BackendInitializationOptions {
 struct Backend {
     client: Client,
     session: Arc<Mutex<Option<Session>>>,
-    workspace_path: Arc<Mutex<Option<String>>>,
-    initializiation_options: Arc<Mutex<Option<BackendInitializationOptions>>>,
+    workspace_path: Arc<RwLock<Option<String>>>,
+    initializiation_options: Arc<RwLock<Option<BackendInitializationOptions>>>,
 }
+
+// TODO folders with [] cause error.
+// TODO updating files in ignored folder cause error.
 
 impl Backend {
     const RESYNC_COMMAND: &str = "resync";
@@ -38,8 +41,8 @@ impl Backend {
         Self {
             client: client.clone(),
             session: Arc::new(Mutex::new(None)),
-            workspace_path: Arc::new(Mutex::new(None)),
-            initializiation_options: Arc::new(Mutex::new(None)),
+            workspace_path: Arc::new(RwLock::new(None)),
+            initializiation_options: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -49,31 +52,28 @@ impl Backend {
             return;
         };
 
-        let workspace_path = self.workspace_path.lock().await;
-        let Some(workspace_path) = workspace_path.as_ref() else {
+        let workspace_path_lock = self.workspace_path.read().await;
+        let Some(workspace_path) = workspace_path_lock.as_ref() else {
             return;
         };
 
-        let initialization_options = self.initializiation_options.lock().await;
-        let Some(initialization_options) = initialization_options.as_ref() else {
+        let initialization_options_lock = self.initializiation_options.read().await;
+        let Some(initialization_options) = initialization_options_lock.as_ref() else {
             return;
         };
 
-        let path = event.uri.path();
+        let local_file_path = event.uri.path();
+
+        let cmd = self.prepare_rsync_update_cmd(
+            session,
+            local_file_path,
+            workspace_path,
+            initialization_options,
+        );
 
         let progress_token = self.progress_sync_start().await;
 
-        let result = match event.typ {
-            FileChangeType::CREATED | FileChangeType::CHANGED => {
-                self.sync_file_updated(session, path, workspace_path, initialization_options)
-                    .await
-            }
-            FileChangeType::DELETED => {
-                self.sync_file_deleted(session, path, workspace_path, initialization_options)
-                    .await
-            }
-            _ => Ok(()),
-        };
+        let result = self.execute_cmd(cmd).await;
 
         self.progress_sync_end(progress_token).await;
 
@@ -81,15 +81,20 @@ impl Backend {
             FileChangeType::CREATED => "created",
             FileChangeType::CHANGED => "changed",
             FileChangeType::DELETED => "deleted",
-            _ => return,
+            _ => unreachable!(),
         };
 
         match result {
             Ok(_) => {
-                info!("Synced {} '{}'", action, path)
+                info!("Synced {} '{}'", action, local_file_path)
             }
             Err(err) => {
-                let msg = format!("Failed to sync {} '{}': {}", action, path, err.to_string());
+                let msg = format!(
+                    "Failed to sync {} '{}': {}",
+                    action,
+                    local_file_path,
+                    err.to_string()
+                );
 
                 error!("{}", msg);
 
@@ -104,21 +109,23 @@ impl Backend {
             return;
         };
 
-        let workspace_path = self.workspace_path.lock().await;
-        let Some(workspace_path) = workspace_path.as_ref() else {
+        let workspace_path_lock = self.workspace_path.read().await;
+        let Some(workspace_path) = workspace_path_lock.as_ref() else {
             return;
         };
 
-        let initialization_options = self.initializiation_options.lock().await;
-        let Some(initialization_options) = initialization_options.as_ref() else {
+        let initialization_options_lock = self.initializiation_options.read().await;
+        let Some(initialization_options) = initialization_options_lock.as_ref() else {
             return;
         };
+
+        let cmd = self.prepare_rsync_full_cmd(session, workspace_path, initialization_options);
 
         let progress_token = self.progress_sync_start().await;
 
-        let result = self
-            .sync_full(session, workspace_path, initialization_options)
-            .await;
+        let result = self.execute_cmd(cmd).await;
+
+        self.progress_sync_end(progress_token).await;
 
         match result {
             Ok(_) => {
@@ -132,50 +139,16 @@ impl Backend {
                 self.client.show_message(MessageType::ERROR, msg).await;
             }
         }
-
-        self.progress_sync_end(progress_token).await;
     }
 
-    async fn sync_file_updated(
+    fn prepare_rsync_update_cmd(
         &self,
         session: &Session,
         local_file_path: &str,
         workspace_path: &str,
         initialization_options: &BackendInitializationOptions,
-    ) -> Result<(), Error> {
-        let remote_file_path =
-            local_file_path.replace(workspace_path, &initialization_options.remote_path);
-
-        let mut cmd = self.prepare_rsync_cmd(session, &initialization_options.exclude);
-
-        cmd.args(&[
-            "-d",
-            local_file_path,
-            &format!("{}:{}", &initialization_options.remote, &remote_file_path),
-        ]);
-
-        self.execute_cmd(cmd).await
-    }
-
-    async fn sync_file_deleted(
-        &self,
-        session: &Session,
-        local_file_path: &str,
-        workspace_path: &str,
-        initialization_options: &BackendInitializationOptions,
-    ) -> Result<(), Error> {
-        let Some(parent) = Path::new(local_file_path).parent() else {
-            return Err(anyhow!(
-                "Failed to get parent from path: {}",
-                local_file_path
-            ));
-        };
-
+    ) -> ProcessCommand {
         let relative_file_path = local_file_path.replace(workspace_path, "");
-
-        let local_folder_path = &parent.to_string_lossy();
-        let remote_folder_path =
-            &local_folder_path.replace(workspace_path, &initialization_options.remote_path);
 
         let mut cmd = self.prepare_rsync_cmd(session, &initialization_options.exclude);
 
@@ -186,19 +159,22 @@ impl Backend {
             &relative_file_path,
             "--exclude",
             "*",
-            &format!("{}{}", local_folder_path, MAIN_SEPARATOR),
-            &format!("{}:{}", &initialization_options.remote, &remote_folder_path),
+            &format!("{}{}", workspace_path, MAIN_SEPARATOR),
+            &format!(
+                "{}:{}",
+                &initialization_options.remote, &initialization_options.remote_path
+            ),
         ]);
 
-        self.execute_cmd(cmd).await
+        cmd
     }
 
-    async fn sync_full(
+    fn prepare_rsync_full_cmd(
         &self,
         session: &Session,
         workspace_path: &str,
         initialization_options: &BackendInitializationOptions,
-    ) -> Result<(), Error> {
+    ) -> ProcessCommand {
         let mut cmd = self.prepare_rsync_cmd(session, &initialization_options.exclude);
 
         cmd.args(&[
@@ -210,7 +186,7 @@ impl Backend {
             ),
         ]);
 
-        self.execute_cmd(cmd).await
+        cmd
     }
 
     fn prepare_rsync_cmd(
@@ -221,7 +197,6 @@ impl Backend {
         let mut cmd = ProcessCommand::new("rsync");
 
         cmd.args(&[
-            "-c",
             "-e",
             &format!("ssh -S \'{}\'", session.control_socket().to_string_lossy()),
         ]);
@@ -329,16 +304,16 @@ impl Backend {
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> JsonRpcResult<InitializeResult> {
-        *self.workspace_path.lock().await = params.root_uri.map(|uri| uri.path().to_string());
+        *self.workspace_path.write().await = params.root_uri.map(|uri| uri.path().to_string());
 
-        *self.initializiation_options.lock().await =
+        *self.initializiation_options.write().await =
             params.initialization_options.and_then(|options| {
                 serde_json::from_value::<BackendInitializationOptions>(options).ok()
             });
 
         if let Some(remote) = self
             .initializiation_options
-            .lock()
+            .read()
             .await
             .as_ref()
             .map(|initialization_options| &initialization_options.remote)
@@ -384,7 +359,7 @@ impl LanguageServer for Backend {
         // Do nothing
     }
 
-    async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
+    async fn did_change_configuration(&self, _params: DidChangeConfigurationParams) {
         // Do nothing
     }
 
