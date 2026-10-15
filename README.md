@@ -1,3 +1,7 @@
-# zed-rsync-lsp
+# Zed rsync language server
 
-Rsync Language Server for Zed
+## TODO
+
+- Publish language server releases automaticly on GitHub.
+- Download language server release from GitHub if no binary override is provided.
+- Add additional configuration settings.

@@ -1,13 +1,14 @@
 use std::path::MAIN_SEPARATOR;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, Error};
-use openssh::{KnownHosts, Session};
+use openssh::{ControlPersist, KnownHosts, Session, SessionBuilder};
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::process::Command as ProcessCommand;
 use tokio::sync::{Mutex, RwLock};
-use tower_lsp::jsonrpc::Result as JsonRpcResult;
+use tower_lsp::jsonrpc::{self, ErrorCode, Result as JsonRpcResult};
 use tower_lsp::lsp_types::notification::Progress;
 use tower_lsp::lsp_types::request::WorkDoneProgressCreate;
 use tower_lsp::lsp_types::*;
@@ -43,169 +44,26 @@ impl Backend {
         }
     }
 
-    async fn handle_file_events(&self, events: Vec<FileEvent>) {
+    async fn do_rsync_cmd(&self, args: Option<&[&str]>) -> Result<(), Error> {
         let session = self.session.lock().await;
         let Some(session) = session.as_ref() else {
-            return;
+            return Ok(());
         };
+
+        // TODO: check if session is ok.
 
         let workspace_path = self.workspace_path.read().await;
         let Some(workspace_path) = workspace_path.as_ref() else {
-            return;
+            return Ok(());
         };
 
         let initialization_options = self.initializiation_options.read().await;
         let Some(initialization_options) = initialization_options.as_ref() else {
-            return;
+            return Ok(());
         };
 
-        let relative_file_paths: Vec<String> = events
-            .iter()
-            .map(|event| {
-                let path = event.uri.path();
+        let mut cmd = self.prepare_rsync_cmd(session, workspace_path, initialization_options, args);
 
-                return path.replace(workspace_path, "");
-            })
-            .collect();
-
-        let cmd = self.prepare_rsync_update_cmd(
-            session,
-            &relative_file_paths,
-            workspace_path,
-            initialization_options,
-        );
-
-        let progress_token = self.progress_sync_start().await;
-
-        let result = self.execute_cmd(cmd).await;
-
-        self.progress_sync_end(progress_token).await;
-
-        let remote_file_paths_msg = relative_file_paths.join(", ");
-
-        match result {
-            Ok(_) => {
-                info!("Synced file(s): {}", remote_file_paths_msg)
-            }
-            Err(err) => {
-                info!("Failed to sync file(s): {}", remote_file_paths_msg);
-                error!("{}", err);
-
-                self.client
-                    .show_message(MessageType::ERROR, err.to_string())
-                    .await;
-            }
-        }
-    }
-
-    async fn handle_resync(&self) {
-        let session = self.session.lock().await;
-        let Some(session) = session.as_ref() else {
-            return;
-        };
-
-        let workspace_path = self.workspace_path.read().await;
-        let Some(workspace_path) = workspace_path.as_ref() else {
-            return;
-        };
-
-        let initialization_options = self.initializiation_options.read().await;
-        let Some(initialization_options) = initialization_options.as_ref() else {
-            return;
-        };
-
-        let cmd = self.prepare_rsync_full_cmd(session, workspace_path, initialization_options);
-
-        let progress_token = self.progress_sync_start().await;
-
-        let result = self.execute_cmd(cmd).await;
-
-        self.progress_sync_end(progress_token).await;
-
-        match result {
-            Ok(_) => {
-                info!("Resynced '{}'", workspace_path)
-            }
-            Err(err) => {
-                let msg = format!("Failed to resync '{}': {}", workspace_path, err.to_string());
-
-                error!("{}", msg);
-
-                self.client.show_message(MessageType::ERROR, msg).await;
-            }
-        }
-    }
-
-    fn prepare_rsync_update_cmd(
-        &self,
-        session: &Session,
-        relative_file_paths: &Vec<String>,
-        workspace_path: &str,
-        initialization_options: &BackendInitializationOptions,
-    ) -> ProcessCommand {
-        let mut cmd = self.prepare_rsync_cmd(session, &initialization_options.exclude);
-
-        cmd.args(&["-dr", "--delete"]);
-
-        for relative_file_path in relative_file_paths {
-            cmd.args(&["--include", &relative_file_path]);
-        }
-
-        cmd.args(&[
-            "--exclude",
-            "*",
-            &format!("{}{}", workspace_path, MAIN_SEPARATOR),
-            &format!(
-                "{}:{}",
-                &initialization_options.remote, &initialization_options.remote_path
-            ),
-        ]);
-
-        cmd
-    }
-
-    fn prepare_rsync_full_cmd(
-        &self,
-        session: &Session,
-        workspace_path: &str,
-        initialization_options: &BackendInitializationOptions,
-    ) -> ProcessCommand {
-        let mut cmd = self.prepare_rsync_cmd(session, &initialization_options.exclude);
-
-        cmd.args(&[
-            "-zr",
-            &format!("{}{}", workspace_path, MAIN_SEPARATOR),
-            &format!(
-                "{}:{}",
-                initialization_options.remote, initialization_options.remote_path
-            ),
-        ]);
-
-        cmd
-    }
-
-    fn prepare_rsync_cmd(
-        &self,
-        session: &Session,
-        exclude: &Option<Vec<String>>,
-    ) -> ProcessCommand {
-        let mut cmd = ProcessCommand::new("rsync");
-
-        cmd.args(&[
-            "-e",
-            &format!("ssh -S \'{}\'", session.control_socket().to_string_lossy()),
-        ]);
-
-        if let Some(exclude) = exclude {
-            for excluded in exclude {
-                cmd.args(&["--exclude", excluded]);
-            }
-        }
-
-        cmd
-    }
-
-    async fn execute_cmd(&self, mut cmd: ProcessCommand) -> Result<(), Error> {
         let output = match cmd.output().await {
             Ok(output) => output,
             Err(err) => return Err(anyhow!(err.to_string())),
@@ -219,6 +77,43 @@ impl Backend {
         }
 
         Ok(())
+    }
+
+    fn prepare_rsync_cmd(
+        &self,
+        session: &Session,
+        workspace_path: &str,
+        initialization_options: &BackendInitializationOptions,
+        args: Option<&[&str]>,
+    ) -> ProcessCommand {
+        let mut cmd = ProcessCommand::new("rsync");
+
+        if let Some(args) = args {
+            cmd.args(args);
+        }
+
+        cmd.args(&[
+            "-t",
+            "--delete",
+            "-e",
+            &format!("ssh -S \'{}\'", session.control_socket().to_string_lossy()),
+        ]);
+
+        if let Some(exclude) = initialization_options.exclude.as_ref() {
+            for excluded in exclude {
+                cmd.args(&["--exclude", excluded]);
+            }
+        }
+
+        cmd.args(&[
+            &format!("{}{}", workspace_path, MAIN_SEPARATOR),
+            &format!(
+                "{}:{}",
+                &initialization_options.remote, &initialization_options.remote_path
+            ),
+        ]);
+
+        cmd
     }
 
     async fn register_file_watchers(&self) {
@@ -237,7 +132,7 @@ impl Backend {
         }
 
         let registration = Registration {
-            id: "file-watchers".to_string(),
+            id: Uuid::new_v4().to_string(),
             method: "workspace/didChangeWatchedFiles".to_string(),
             register_options: Some(registration_options.unwrap()),
         };
@@ -270,13 +165,13 @@ impl Backend {
             .ok()
     }
 
-    async fn progress_sync_start(&self) -> String {
+    async fn progress_start(&self, title: String) -> String {
         let token = Uuid::new_v4().to_string();
 
         self.create_progress(token.clone()).await;
 
         let work_done_begin = WorkDoneProgressBegin {
-            title: "Syncing".to_string(),
+            title,
             ..Default::default()
         };
 
@@ -286,7 +181,7 @@ impl Backend {
         token
     }
 
-    async fn progress_sync_end(&self, token: String) {
+    async fn progress_end(&self, token: String) {
         let work_done_end = WorkDoneProgressEnd {
             ..Default::default()
         };
@@ -301,10 +196,29 @@ impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> JsonRpcResult<InitializeResult> {
         *self.workspace_path.write().await = params.root_uri.map(|uri| uri.path().to_string());
 
-        *self.initializiation_options.write().await =
-            params.initialization_options.and_then(|options| {
-                serde_json::from_value::<BackendInitializationOptions>(options).ok()
-            });
+        if let Some(initialization_options) = params.initialization_options {
+            let initialization_options =
+                serde_json::from_value::<BackendInitializationOptions>(initialization_options);
+
+            if let Err(err) = initialization_options {
+                error!(
+                    "Failed to parse initialization options: {}",
+                    err.to_string()
+                );
+
+                return Err(jsonrpc::Error {
+                    code: ErrorCode::ParseError,
+                    message: format!(
+                        "Failed to parse initialization options: {}",
+                        err.to_string()
+                    )
+                    .into(),
+                    data: None,
+                });
+            }
+
+            *self.initializiation_options.write().await = initialization_options.ok();
+        }
 
         if let Some(remote) = self
             .initializiation_options
@@ -313,17 +227,36 @@ impl LanguageServer for Backend {
             .as_ref()
             .map(|initialization_options| &initialization_options.remote)
         {
-            let session = Session::connect(remote, KnownHosts::Strict).await;
+            let mut builder = SessionBuilder::default();
 
-            match session {
-                Ok(session) => {
-                    *self.session.lock().await = Some(session);
-                    info!("Started session");
-                }
-                Err(err) => {
-                    error!("Failed to start session: {}", err);
-                }
+            builder
+                .known_hosts_check(KnownHosts::Strict)
+                .control_persist(ControlPersist::Forever)
+                .connect_timeout(Duration::from_secs(30))
+                .server_alive_interval(Duration::from_secs(30));
+
+            info!("Starting session");
+
+            let session = builder.connect(remote).await.map_err(|err| jsonrpc::Error {
+                code: ErrorCode::InternalError,
+                message: format!("Failed to start session: {}", err.to_string()).into(),
+                data: None,
+            });
+
+            if let Err(err) = session {
+                error!("{}", err.message);
+                return Err(err);
             }
+
+            let session = session.unwrap();
+
+            info!("Started session");
+            info!(
+                "Session control socket: '{}'",
+                session.control_socket().to_string_lossy()
+            );
+
+            *self.session.lock().await = Some(session);
         }
 
         Ok(InitializeResult {
@@ -343,7 +276,24 @@ impl LanguageServer for Backend {
     async fn initialized(&self, _: InitializedParams) {
         self.register_file_watchers().await;
 
-        self.handle_resync().await;
+        let progress_token = self.progress_start("Syncing".to_string()).await;
+        let result = self.do_rsync_cmd(Some(&["-zar"])).await;
+        self.progress_end(progress_token).await;
+
+        match result {
+            Ok(_) => info!("Completed initial sync"),
+            Err(err) => {
+                info!("Initial sync failed");
+                error!("{}", err.to_string());
+
+                self.client
+                    .show_message(
+                        MessageType::ERROR,
+                        format!("Sync failed: {}", err.to_string()),
+                    )
+                    .await;
+            }
+        }
     }
 
     async fn did_open(&self, _params: DidOpenTextDocumentParams) {
@@ -359,17 +309,75 @@ impl LanguageServer for Backend {
     }
 
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
-        self.handle_file_events(params.changes).await;
+        let workspace_path = self.workspace_path.read().await;
+        let Some(workspace_path) = workspace_path.as_ref() else {
+            error!("Workspace path is missing");
+            return;
+        };
+
+        let include: Vec<&str> = params
+            .changes
+            .iter()
+            .filter_map(|event| event.uri.path().strip_prefix(workspace_path))
+            .collect();
+
+        let mut args = vec!["-dr"];
+
+        for included in &include {
+            args.extend_from_slice(&["--include", included]);
+        }
+
+        let progress_token = self.progress_start("Syncing".to_string()).await;
+        let result = self.do_rsync_cmd(Some(&args)).await;
+        self.progress_end(progress_token).await;
+
+        let all_included_files = include.join(", ");
+
+        match result {
+            Ok(_) => {
+                info!("Synced file(s): {}", all_included_files)
+            }
+            Err(err) => {
+                info!("Failed to sync file(s): {}", all_included_files);
+                error!("{}", err);
+
+                self.client
+                    .show_message(MessageType::ERROR, err.to_string())
+                    .await;
+            }
+        }
     }
 
     async fn execute_command(&self, params: ExecuteCommandParams) -> JsonRpcResult<Option<Value>> {
         if &params.command != Backend::RESYNC_COMMAND {
-            return Ok(None);
+            return Err(jsonrpc::Error {
+                code: ErrorCode::MethodNotFound,
+                message: "".into(),
+                data: None,
+            });
         }
 
-        self.handle_resync().await;
+        let progress_token = self.progress_start("Syncing".to_string()).await;
+        let result = self.do_rsync_cmd(Some(&["-zar"])).await;
+        self.progress_end(progress_token).await;
 
-        Ok(None)
+        match result {
+            Ok(_) => {
+                info!("Completed sync");
+
+                Ok(None)
+            }
+            Err(err) => {
+                info!("Sync failed");
+                error!("{}", err.to_string());
+
+                Err(jsonrpc::Error {
+                    code: ErrorCode::InternalError,
+                    message: format!("Failed to sync: {}", err.to_string()).into(),
+                    data: None,
+                })
+            }
+        }
     }
 
     async fn shutdown(&self) -> JsonRpcResult<()> {
